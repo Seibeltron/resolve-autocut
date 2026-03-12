@@ -8,24 +8,36 @@ AI-powered DaVinci Resolve timeline builder. Transcribes a video, lets you pick 
 
 - **macOS only** (Resolve's Python scripting bridge is Mac-specific)
 - **DaVinci Resolve** installed and running with a project open
-- **Resolve scripting enabled**: Preferences → System → General → tick "Enable Resolve scripting via local network"
-- **FFmpeg** installed: `brew install ffmpeg`
+- **Resolve scripting enabled**: Preferences → System → General → tick "Enable Resolve scripting via local network" *(one manual step — see setup)*
+- **Homebrew** installed: https://brew.sh
 - **Python 3.12+** installed: `brew install python@3.12`
-- **OpenAI API key** set in your shell:
-  ```bash
-  echo 'export OPENAI_API_KEY="sk-..."' >> ~/.zshrc && source ~/.zshrc
-  ```
+- **Shopify OpenAI API key**: https://openai-proxy.shopify.io/dashboard → Generate Key
 
-The `.venv` is created automatically on first run — no other manual setup needed.
+---
+
+## Setup (one command)
+
+```bash
+git clone https://github.com/Seibeltron/resolve-autocut.git ~/resolve-autocut
+bash ~/resolve-autocut/setup.sh
+```
+
+`setup.sh` handles everything automatically:
+- Installs FFmpeg
+- Prompts for your Shopify OpenAI key and saves it to `~/.zshrc`
+- Creates the Python venv and installs dependencies
+- Clones and installs the DaVinci Resolve MCP server for Claude Code
+
+The only manual step is enabling Resolve scripting in Preferences (the script tells you exactly where).
 
 ---
 
 ## How to Use (with Claude Code)
 
-### Step 1 — Clone and open in VS Code
+### Step 1 — Open in VS Code
 
 ```bash
-git clone https://github.com/Seibeltron/resolve-autocut.git ~/resolve-autocut
+source ~/.zshrc
 code ~/resolve-autocut
 ```
 
