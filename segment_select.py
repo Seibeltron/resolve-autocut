@@ -144,7 +144,7 @@ Prefer clips that START with a new, complete idea rather than a callback.
     user_prompt = f"""Create a {target_duration:.0f}-second highlight reel from this Shopify all-hands transcript.
 
 FOCUS TOPIC: "{topic}"
-TARGET DURATION: {target_duration:.0f}s (acceptable range: {target_duration * 0.8:.0f}s – {target_duration * 1.2:.0f}s)
+TARGET DURATION: {target_duration:.0f}s (HARD minimum {target_duration * 0.9:.0f}s, maximum {target_duration * 1.1:.0f}s — you MUST reach the minimum, include good-but-not-perfect clips if needed)
 TOTAL SOURCE DURATION: {total_dur:.0f}s
 
 SELECTION RULES:
@@ -171,18 +171,9 @@ Respond with JSON only, no markdown:
   "cold_open_index": <integer segment index, or null>,
   "selected_indices": [<integers in final playback order>],
   "total_duration_s": <sum of durations of selected segments>,
-  "summary": "<2–3 sentence description of what you selected and the narrative arc>",
+  "summary": "<2-3 sentence description of what you selected and the narrative arc>",
   "flow_note": "<brief note on why this ordering creates a coherent story>",
-  "transition_notes": [
-    "<why clip[0] flows into clip[1], or 'DANGLING REF: [phrase]' if it doesn't>",
-    "<why clip[1] flows into clip[2]>",
-    "..."
-  ],
-  "narrative_map": [
-    {{"index": <segment_index>, "role": "<HOOK|SETUP|BODY|PAYOFF>"}},
-    ...
-  ],
-  "sign_off_bleed": "<list any clips that end with sign-off content that should be trimmed>",
+  "sign_off_bleed": "<segment index of any clip ending with sign-off content, or empty string>",
   "excluded_reason": "<brief note on high-quality segments you excluded and why>"
 }}"""
 
@@ -212,6 +203,20 @@ Respond with JSON only, no markdown:
     # Promote cold open to position 0 (if not already there)
     if cold_open_idx is not None and cold_open_idx in selected_indices:
         selected_indices = [cold_open_idx] + [i for i in selected_indices if i != cold_open_idx]
+
+    # Enforce duration window: trim from the end if over max, warn if under min
+    max_dur = target_duration * 1.1
+    min_dur = target_duration * 0.9
+    total = sum(segments[i]["end"] - segments[i]["start"] for i in selected_indices)
+    if total > max_dur:
+        # Drop non-cold-open clips from the end until within range
+        trimmed = list(selected_indices)
+        while trimmed and sum(segments[i]["end"] - segments[i]["start"] for i in trimmed) > max_dur:
+            # Never remove cold open (position 0)
+            trimmed.pop()
+        selected_indices = trimmed
+    elif total < min_dur:
+        print(f"  [warn] Selected {total:.0f}s < minimum {min_dur:.0f}s — GPT under-selected", file=sys.stderr)
 
     selected_segs = []
     for idx in selected_indices:
@@ -272,7 +277,7 @@ def print_selection_report(result: Dict) -> None:
         print(f"      \"{text_preview}\"", file=sys.stderr)
 
         # Show transition to next clip
-        if i < len(segments) - 1 and i < len(transition_notes):
+        if i < len(segments) - 1 and transition_notes and i < len(transition_notes):
             note = transition_notes[i]
             flag = "  ⚠ " if "DANGLING" in note.upper() else "  → "
             print(f"      {flag}{note}", file=sys.stderr)
