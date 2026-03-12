@@ -1,91 +1,107 @@
 # Resolve Autocut
 
-AI-powered DaVinci Resolve timeline builder. Tell Claude what video to cut and what topics to focus on — it transcribes the video, selects the best segments, and builds a ready-to-edit timeline in Resolve.
-
----
-
-## What It Does
-
-1. Transcribes your video with word-accurate timestamps
-2. Claude reads the transcript, summarizes it, and identifies topic categories
-3. You pick which topics to include and set a target duration
-4. Claude scores and selects the best segments
-5. A DaVinci Resolve timeline is built automatically — each segment becomes an editable clip
-
-The source video is **never modified**. All cuts are fully adjustable in Resolve's Edit page.
+AI-powered DaVinci Resolve timeline builder. Transcribes a video, lets you pick which topics to include, selects the best segments with GPT-4o storytelling logic, and builds a ready-to-edit timeline in Resolve automatically.
 
 ---
 
 ## Requirements
 
-- **DaVinci Resolve** must be running with a project open
-- **FFmpeg** installed (`brew install ffmpeg`)
-- **Python 3.12+** installed (`brew install python@3.12`)
-- The `.venv` is created automatically on first run (no manual setup needed)
+- **macOS only** (Resolve's Python scripting bridge is Mac-specific)
+- **DaVinci Resolve** installed and running with a project open
+- **Resolve scripting enabled**: Preferences → System → General → tick "Enable Resolve scripting via local network"
+- **FFmpeg** installed: `brew install ffmpeg`
+- **Python 3.12+** installed: `brew install python@3.12`
+- **OpenAI API key** set in your shell:
+  ```bash
+  echo 'export OPENAI_API_KEY="sk-..."' >> ~/.zshrc && source ~/.zshrc
+  ```
+
+The `.venv` is created automatically on first run — no other manual setup needed.
 
 ---
 
-## How to Use
+## How to Use (with Claude Code)
 
-### Step 1 — Open Claude Code in VS Code
+### Step 1 — Clone and open in VS Code
 
-Open the `resolve-autocut` folder in VS Code, then open the Claude panel (the `>_` icon in the sidebar or press `Cmd+Shift+P` → "Claude").
+```bash
+git clone https://github.com/Seibeltron/resolve-autocut.git ~/resolve-autocut
+code ~/resolve-autocut
+```
+
+Open the Claude panel (`Cmd+Shift+P` → "Claude: Open") and load the `resolve-autocut` folder.
 
 ### Step 2 — Tell Claude to autocut your video
 
-Type something like:
-
 ```
-Autocut /path/to/my-video.mp4, focus on the product demo and Q&A sections, target 2 minutes
+Autocut /path/to/my-video.mp4, target 2 minutes
 ```
 
-Or drag your video file into the chat to get its path.
+Or drag the video file into the chat to get its path.
 
 Claude will:
-- Run the transcription (this takes a minute or two depending on video length)
-- Show you a summary and list of topic categories it found
-- Ask which topics you want to keep
+1. Transcribe the video (1–2 min depending on length)
+2. Show a summary and lettered topic categories (A, B, C…)
+3. Ask which topics you want — reply e.g. `a c d`
+4. Select the best segments using GPT-4o narrative logic
+5. Run a trim pass to tighten each clip
+6. Build the timeline in Resolve automatically
 
-### Step 3 — Review and confirm
+### Step 3 — Review in Resolve
 
-Claude will show you the selected segments with start/end times and text previews. You can ask it to add, remove, or swap segments before building.
-
-### Step 4 — Timeline appears in Resolve
-
-Once confirmed, Claude runs `build_timeline.py` and the timeline appears in DaVinci Resolve automatically. Switch to the Edit page to review your cut.
+Switch to the Edit page in DaVinci Resolve. Each segment is a separate clip you can trim, reorder, or swap.
 
 ---
 
-## Running Manually (Command Line)
+## How It Works (Pipeline)
 
-If you prefer to run the scripts directly from the VS Code terminal (`Ctrl+`` ` `` or Terminal → New Terminal):
+```
+transcribe.py   →  segment_select.py  →  trim_pass.py  →  build_timeline.py
+  (Whisper)         (GPT-4o picks        (GPT-4o trims     (Resolve Python
+  word timestamps   best segments        bridge phrases,   API builds
+  via OpenAI API)   w/ 3-act narrative   protects          timeline)
+                    structure)           punchlines)
+```
+
+### Segment Selection (`segment_select.py`)
+GPT-4o reads the full transcript and selects clips using:
+- **3-act structure**: Hook → Body → Payoff
+- **Transition coherence**: checks every clip boundary for dangling references ("Speaking of X..." requires X to have been mentioned)
+- **Shopify context**: merchant-first framing, meaning over metrics
+- **Sign-off detection**: closing remarks only appear as the final clip
+
+### Trim Pass (`trim_pass.py`)
+After selection, each clip is tightened by GPT-4o:
+- Removes bridge phrases from clip starts ("Next up...", "Speaking of...")
+- Defers sign-off bleed to the end of the edit
+- Protects intentional payoff moments (punchlines, callbacks)
+- Stores `trim_note` on each segment so the build step auto-skips the refine pass
+
+---
+
+## Running from the Terminal
 
 ```bash
 cd ~/resolve-autocut
 
-# Transcribe a video
-.venv/bin/python3 transcribe.py /path/to/video.mp4 > /tmp/transcript.json
+# Full pipeline manually:
 
-# Build a timeline from a segments JSON file
-./run.sh /path/to/video.mp4 /tmp/segments.json
+# 1. Transcribe
+./run.sh --transcribe /path/to/video.mp4 > /tmp/transcript.json
 
-# Custom timeline name
-./run.sh /path/to/video.mp4 /tmp/segments.json --timeline-name "Q3 Highlights"
+# 2. Select segments (GPT-4o)
+./run.sh --select /tmp/transcript.json \
+  --topic "product wins, merchant stories" \
+  --duration 120 \
+  -o /tmp/segments.json
 
-# Skip the word-boundary refinement pass (faster, slightly less precise)
-./run.sh /path/to/video.mp4 /tmp/segments.json --no-refine
-```
+# 3. Trim pass (GPT-4o)
+./run.sh --trim /tmp/segments.json /tmp/transcript.json \
+  --keep "any phrase to protect from trimming" \
+  -o /tmp/trimmed.json
 
----
-
-## What the Refinement Pass Does
-
-After selecting segments, the script checks each clip's cut point against the source audio. If a word is being cut off mid-syllable, it automatically extends the clip to the next natural pause in speech. You'll see a report like:
-
-```
-Clip 1: ✓ OK (slack 320ms, ends: "all the headlines.")
-Clip 3: ⚠ extended +2836ms (phrase: "geographies at an insane pace." → pause)
-Clip 6: ⚠ extended +3670ms (phrase: "world's biggest brands in a decade or less." → pause)
+# 4. Build timeline in Resolve
+./run.sh /path/to/video.mp4 /tmp/trimmed.json --timeline-name "My Cut"
 ```
 
 ---
@@ -93,16 +109,16 @@ Clip 6: ⚠ extended +3670ms (phrase: "world's biggest brands in a decade or les
 ## Troubleshooting
 
 **"Could not connect to DaVinci Resolve"**
-→ Make sure Resolve is open and a project is loaded before running the script.
+→ Make sure Resolve is open with a project loaded. Check that scripting is enabled: Preferences → System → General → "Enable Resolve scripting via local network".
 
-**"No project open in DaVinci Resolve"**
-→ Open or create a project in Resolve (File → New Project), then re-run.
+**"OPENAI_API_KEY not set"**
+→ Add it to your shell: `echo 'export OPENAI_API_KEY="sk-..."' >> ~/.zshrc && source ~/.zshrc`
 
 **Timeline frame rate is wrong**
-→ The script auto-detects the source video's frame rate and sets the project fps before creating the timeline. This only works on a fresh project with no existing timelines. If you have other timelines in the project, create a new project in Resolve first.
-
-**Refinement skipped ("faster-whisper not available")**
-→ Run using `.venv/bin/python3` or `./run.sh` rather than your system Python. The venv has faster-whisper installed; system Python does not.
+→ The script auto-detects fps from the source video. If your Resolve project already has timelines at a different fps, create a new project first.
 
 **Audio missing from clips**
-→ Do not pass `mediaType` in the clip dict — this is a known Resolve API quirk where `mediaType: 1` means video-only (not video+audio as documented). The scripts are already set up correctly.
+→ This is a known Resolve API quirk — `mediaType: 1` means video-only, not video+audio as documented. The scripts are already set up correctly; if you see this, check you're using `./run.sh` not a direct Python call with custom args.
+
+**Refinement skipped ("faster-whisper not available")**
+→ Run via `./run.sh` or `.venv/bin/python3` rather than system Python. The venv has all dependencies installed.
