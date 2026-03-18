@@ -23,10 +23,17 @@ from typing import Dict, List, Optional
 
 
 def _words_for_segment(seg: Dict, all_words: List[Dict]) -> List[Dict]:
-    """Return words from the transcript that fall within the segment's time range."""
+    """Return words from the transcript that fall within the segment's time range.
+
+    When source_video is present on the segment, only words from the same source
+    file are considered — this prevents false matches when two source files have
+    overlapping timestamps (both starting near 0s).
+    """
+    source = seg.get("source_video")
     return [
         w for w in all_words
-        if w["start"] >= seg["start"] - 0.1 and w["end"] <= seg["end"] + 0.1
+        if (source is None or w.get("source_video") == source)
+        and w["start"] >= seg["start"] - 0.1 and w["end"] <= seg["end"] + 0.1
     ]
 
 

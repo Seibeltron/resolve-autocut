@@ -18,9 +18,10 @@ Usage:
 
 import json
 import os
+import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 # Words/phrases that make for a poor in-point — GPT is asked to avoid these,
@@ -41,10 +42,68 @@ def _fmt_seg_list(segments: List[Dict]) -> str:
     for i, seg in enumerate(segments):
         dur = seg["end"] - seg["start"]
         filler = " [FILLER START]" if _has_filler_start(seg.get("text", "")) else ""
+        source = seg.get("source_video", "")
+        source_label = f" [SRC:{Path(source).name}]" if source else ""
         lines.append(
-            f"[{i}] {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s){filler}: {seg.get('text', '')}"
+            f"[{i}] {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s){source_label}{filler}: {seg.get('text', '')}"
         )
     return "\n".join(lines)
+
+
+def _is_multi_source(segments: List[Dict]) -> bool:
+    sources = {s.get("source_video") for s in segments if s.get("source_video")}
+    return len(sources) > 1
+
+
+def suggest_topics(transcript: Dict, n: int = 6) -> List[str]:
+    """Use GPT-4o to suggest N distinct topics present in the transcript."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return []
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    segments = transcript.get("segments", [])
+    seg_text = _fmt_seg_list(segments)
+    total_dur = transcript.get("total_duration", 0)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a video editor analyzing interview/testimonial transcripts. "
+                    "Your job is to identify distinct, meaningful themes suitable for a highlight reel."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Here are {len(segments)} transcript segments ({total_dur:.0f}s total):\n\n"
+                    f"{seg_text}\n\n"
+                    f"Identify exactly {n} distinct topics or themes that appear in these segments "
+                    "and would make compelling highlight reels. Each topic should be specific enough "
+                    "to guide segment selection, not generic. "
+                    "Return JSON only: {\"topics\": [\"topic 1\", \"topic 2\", ...]}"
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.4,
+    )
+
+    raw = response.choices[0].message.content
+    try:
+        return json.loads(raw).get("topics", [])[:n]
+    except (json.JSONDecodeError, AttributeError):
+        return []
 
 
 def select_segments(
@@ -52,6 +111,7 @@ def select_segments(
     topic: str,
     target_duration: float,
     cold_open: bool = True,
+    mix: bool = False,
 ) -> Dict:
     """Use GPT-4o to select coherent segments from a transcript."""
     try:
@@ -71,7 +131,21 @@ def select_segments(
         return {"error": "No segments in transcript"}
 
     total_dur = transcript.get("total_duration", 0)
-    seg_text = _fmt_seg_list(segments)
+    multi_source = _is_multi_source(segments)
+    sources = transcript.get("sources", [])
+    source_names = [Path(s).name for s in sources] if sources else []
+
+    # When mix=True, shuffle the presentation order so GPT doesn't have source-file bias.
+    # We keep a mapping from shuffled position → original index so returned indices map back.
+    if mix and multi_source:
+        shuffle_order = list(range(len(segments)))
+        random.shuffle(shuffle_order)
+        presented_segments = [segments[i] for i in shuffle_order]
+    else:
+        shuffle_order = list(range(len(segments)))
+        presented_segments = segments
+
+    seg_text = _fmt_seg_list(presented_segments)
 
     cold_open_instruction = (
         "4. Identify the single best COLD OPEN: a compelling 8–15s moment that works as a "
@@ -141,11 +215,32 @@ Prefer clips that START with a new, complete idea rather than a callback.
   belong ONLY as the absolute final clip. If a great clip ends with sign-off bleed, note it — \
   trim_pass.py will handle it."""
 
+    multi_source_note = ""
+    if multi_source:
+        names_str = ", ".join(source_names) if source_names else "multiple files"
+        if mix:
+            multi_source_note = (
+                f"\nMULTI-SOURCE NOTE: Segments come from {len(source_names)} different video files "
+                f"({names_str}). Each segment is labeled [SRC:filename]. "
+                "SEGMENTS HAVE BEEN PRESENTED IN RANDOM ORDER — do NOT assume adjacent segments "
+                "in this list are from the same source or in chronological order. "
+                "You MUST draw clips from MULTIPLE source files — ideally all of them — "
+                "to build the richest possible narrative. Actively prefer alternating between "
+                "sources rather than clustering clips from the same file together.\n"
+            )
+        else:
+            multi_source_note = (
+                f"\nMULTI-SOURCE NOTE: Segments come from {len(source_names)} different video files "
+                f"({names_str}). Each segment is labeled [SRC:filename]. "
+                "You may freely interleave clips from different sources to build the best narrative. "
+                "Treat each source as a separate speaker or camera angle unless context suggests otherwise.\n"
+            )
+
     user_prompt = f"""Create a {target_duration:.0f}-second highlight reel from this Shopify all-hands transcript.
 
 FOCUS TOPIC: "{topic}"
 TARGET DURATION: {target_duration:.0f}s (HARD minimum {target_duration * 0.9:.0f}s, maximum {target_duration * 1.1:.0f}s — you MUST reach the minimum, include good-but-not-perfect clips if needed)
-TOTAL SOURCE DURATION: {total_dur:.0f}s
+TOTAL SOURCE DURATION: {total_dur:.0f}s{multi_source_note}
 
 SELECTION RULES:
 1. Segments must be relevant to the focus topic
@@ -194,11 +289,18 @@ Respond with JSON only, no markdown:
     except json.JSONDecodeError as e:
         return {"error": f"GPT-4o returned invalid JSON: {e}\n{raw[:500]}"}
 
-    cold_open_idx = gpt_result.get("cold_open_index")
-    selected_indices = gpt_result.get("selected_indices", [])
+    cold_open_idx_presented = gpt_result.get("cold_open_index")
+    selected_indices_presented = gpt_result.get("selected_indices", [])
 
-    # Validate indices
-    selected_indices = [i for i in selected_indices if isinstance(i, int) and 0 <= i < len(segments)]
+    # Validate against the presented list length
+    selected_indices_presented = [
+        i for i in selected_indices_presented
+        if isinstance(i, int) and 0 <= i < len(presented_segments)
+    ]
+
+    # Map presented indices → original segment indices
+    selected_indices = [shuffle_order[i] for i in selected_indices_presented]
+    cold_open_idx = shuffle_order[cold_open_idx_presented] if cold_open_idx_presented is not None else None
 
     # Promote cold open to position 0 (if not already there)
     if cold_open_idx is not None and cold_open_idx in selected_indices:
@@ -299,11 +401,17 @@ if __name__ == "__main__":
         description="GPT-4o segment selection for resolve-autocut."
     )
     parser.add_argument("transcript_json", help="Path to transcript JSON from transcribe.py")
-    parser.add_argument("--topic", required=True, help="Focus topic / keywords for selection")
-    parser.add_argument("--duration", type=float, required=True,
+    parser.add_argument("--suggest-topics", action="store_true",
+                        help="Print N suggested topics from the transcript and exit")
+    parser.add_argument("--n-topics", type=int, default=6,
+                        help="Number of topics to suggest (default: 6)")
+    parser.add_argument("--topic", default=None, help="Focus topic / keywords for selection")
+    parser.add_argument("--duration", type=float, required=False, default=None,
                         help="Target duration in seconds (e.g. 180 for 3 minutes)")
     parser.add_argument("--no-cold-open", action="store_true",
                         help="Disable cold open detection")
+    parser.add_argument("--mix", action="store_true",
+                        help="Shuffle segment presentation to GPT to encourage cross-source mixing")
     parser.add_argument("--output", "-o", default=None,
                         help="Write segments JSON to this file (default: stdout)")
     args = parser.parse_args()
@@ -320,11 +428,27 @@ if __name__ == "__main__":
     if isinstance(transcript, list):
         transcript = {"segments": transcript}
 
+    if args.suggest_topics:
+        print("Analyzing transcript for topics...", file=sys.stderr)
+        topics = suggest_topics(transcript, n=args.n_topics)
+        for i, t in enumerate(topics, 1):
+            print(f"{i}. {t}")
+        sys.exit(0)
+
+    if not args.topic:
+        print("Error: --topic is required (or use --suggest-topics)", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.duration:
+        print("Error: --duration is required", file=sys.stderr)
+        sys.exit(1)
+
     result = select_segments(
         transcript,
         topic=args.topic,
         target_duration=args.duration,
         cold_open=not args.no_cold_open,
+        mix=args.mix,
     )
 
     if "error" in result:

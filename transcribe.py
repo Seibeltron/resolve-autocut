@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 transcribe.py — Word-accurate transcription using OpenAI Whisper API.
-Outputs JSON to stdout: {segments, words, total_duration, method}
+Outputs JSON to stdout: {segments, words, total_duration, method, sources}
+
+Each segment and word is tagged with source_video (absolute path) to support
+multi-clip workflows where segments from different files are merged.
 
 Results are cached in ~/.cache/resolve-autocut/ keyed by file path + mtime.
 Re-running on the same file returns the cached result instantly.
@@ -10,6 +13,8 @@ Usage:
     python transcribe.py /path/to/video.mp4
     python transcribe.py /path/to/video.mp4 > transcript.json
     python transcribe.py /path/to/video.mp4 --no-cache
+    python transcribe.py video1.mp4 video2.mp4 > combined.json
+    python transcribe.py /path/to/folder/ > combined.json
 """
 
 import hashlib
@@ -22,6 +27,25 @@ from typing import Dict, List
 
 WORD_PAD_S = 0.05  # 50ms padding on each word boundary
 CACHE_DIR = Path.home() / ".cache" / "resolve-autocut"
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v", ".mts", ".avi", ".webm"}
+
+
+def expand_paths(paths: List[str]) -> List[str]:
+    """Expand any directory paths to sorted lists of video files within them."""
+    expanded = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            files = sorted(
+                f for f in path.iterdir()
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+            )
+            if not files:
+                print(f"Warning: no video files found in {path}", file=sys.stderr)
+            expanded.extend(str(f) for f in files)
+        else:
+            expanded.append(p)
+    return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -303,50 +327,133 @@ def transcribe(video_path: str) -> Dict:
     total_dur = max(w["end"] for w in all_words)
     segments = score_segments(segments, total_dur)
 
+    # Tag every segment and word with the absolute source path
+    abs_path = str(Path(video_path).resolve())
+    for seg in segments:
+        seg["source_video"] = abs_path
+    for w in all_words:
+        w["source_video"] = abs_path
+
     return {
         "segments": segments,
         "words": all_words,
         "total_duration": total_dur,
         "method": "openai-whisper",
+        "sources": [abs_path],
+    }
+
+
+def transcribe_many(video_paths: List[str], no_cache: bool = False) -> Dict:
+    """Transcribe multiple videos and merge into a single combined transcript.
+
+    Each segment/word is tagged with source_video so downstream tools can map
+    segments back to the correct source file when building a multi-clip timeline.
+    """
+    all_segments: List[Dict] = []
+    all_words: List[Dict] = []
+    sources: List[str] = []
+
+    for path in video_paths:
+        abs_path = str(Path(path).resolve())
+        sources.append(abs_path)
+
+        if not no_cache:
+            cached = load_cached(abs_path)
+            if cached:
+                print(f"Using cached transcript for {Path(abs_path).name} "
+                      f"({len(cached['segments'])} segments)", file=sys.stderr)
+                # Back-fill source_video on old caches that predate this field
+                for seg in cached.get("segments", []):
+                    seg.setdefault("source_video", abs_path)
+                for w in cached.get("words", []):
+                    w.setdefault("source_video", abs_path)
+                all_segments.extend(cached["segments"])
+                all_words.extend(cached["words"])
+                continue
+
+        print(f"Transcribing: {Path(abs_path).name}", file=sys.stderr)
+        result = transcribe(abs_path)
+        if "error" in result:
+            print(f"Error transcribing {Path(abs_path).name}: {result['error']}", file=sys.stderr)
+            continue
+
+        save_cache(abs_path, result)
+        print(f"Cached: {_cache_path(abs_path)}", file=sys.stderr)
+        all_segments.extend(result["segments"])
+        all_words.extend(result["words"])
+
+    if not all_words:
+        return {"error": "No speech detected in any source file"}
+
+    total_dur = max(w["end"] for w in all_words)
+    return {
+        "segments": all_segments,
+        "words": all_words,
+        "total_duration": total_dur,
+        "method": "openai-whisper",
+        "sources": sources,
     }
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Transcribe a video with word-accurate timestamps.")
-    parser.add_argument("video_path", help="Path to the source video file")
+    parser = argparse.ArgumentParser(description="Transcribe one or more videos with word-accurate timestamps.")
+    parser.add_argument("video_paths", nargs="+", help="Path(s) to source video file(s)")
     parser.add_argument("--no-cache", action="store_true", help="Skip cache lookup and force re-transcription")
     args = parser.parse_args()
 
-    path = args.video_path
-    if not Path(path).exists():
-        print(f"File not found: {path}", file=sys.stderr)
+    video_paths = expand_paths(args.video_paths)
+
+    if not video_paths:
+        print("ERROR: No video files found.", file=sys.stderr)
         sys.exit(1)
 
-    # Check cache first
-    if not args.no_cache:
-        cached = load_cached(path)
-        if cached:
-            print(f"Using cached transcript ({len(cached['segments'])} segments)", file=sys.stderr)
-            json.dump(cached, sys.stdout, indent=2)
-            print()
-            sys.exit(0)
+    for path in video_paths:
+        if not Path(path).exists():
+            print(f"File not found: {path}", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"Transcribing: {path}", file=sys.stderr)
-    result = transcribe(path)
+    if len(video_paths) == 1:
+        path = video_paths[0]
+        # Check cache first
+        if not args.no_cache:
+            cached = load_cached(path)
+            if cached:
+                print(f"Using cached transcript ({len(cached['segments'])} segments)", file=sys.stderr)
+                # Back-fill source_video on old caches
+                abs_path = str(Path(path).resolve())
+                for seg in cached.get("segments", []):
+                    seg.setdefault("source_video", abs_path)
+                for w in cached.get("words", []):
+                    w.setdefault("source_video", abs_path)
+                json.dump(cached, sys.stdout, indent=2)
+                print()
+                sys.exit(0)
 
-    if "error" in result:
-        print(f"Error: {result['error']}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Transcribing: {path}", file=sys.stderr)
+        result = transcribe(path)
 
-    seg_count = len(result["segments"])
-    dur = result["total_duration"]
-    print(f"Done: {seg_count} segments, {dur:.1f}s total", file=sys.stderr)
+        if "error" in result:
+            print(f"Error: {result['error']}", file=sys.stderr)
+            sys.exit(1)
 
-    # Save to cache
-    save_cache(path, result)
-    print(f"Cached to: {_cache_path(path)}", file=sys.stderr)
+        seg_count = len(result["segments"])
+        dur = result["total_duration"]
+        print(f"Done: {seg_count} segments, {dur:.1f}s total", file=sys.stderr)
+
+        save_cache(path, result)
+        print(f"Cached to: {_cache_path(path)}", file=sys.stderr)
+    else:
+        # Multiple files: use transcribe_many()
+        result = transcribe_many(video_paths, no_cache=args.no_cache)
+        if "error" in result:
+            print(f"Error: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        seg_count = len(result["segments"])
+        dur = result["total_duration"]
+        n = len(result.get("sources", []))
+        print(f"Done: {seg_count} segments from {n} files, {dur:.1f}s total", file=sys.stderr)
 
     json.dump(result, sys.stdout, indent=2)
     print()  # trailing newline
