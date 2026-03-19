@@ -53,10 +53,12 @@ case "$1" in
         INPUT="$1"; shift
         N_TOPICS=6
         NO_CACHE=""
+        MODEL_ARG=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --n) N_TOPICS="$2"; shift 2 ;;
                 --no-cache) NO_CACHE="--no-cache"; shift ;;
+                --model) MODEL_ARG="--model $2"; shift 2 ;;
                 *) echo "Unknown argument: $1" >&2; exit 1 ;;
             esac
         done
@@ -64,7 +66,7 @@ case "$1" in
         trap 'rm -rf "$TMPDIR_WORK"' EXIT
         TRANSCRIPT="$TMPDIR_WORK/transcript.json"
         .venv/bin/python3 transcribe.py $NO_CACHE "$INPUT" > "$TRANSCRIPT"
-        .venv/bin/python3 segment_select.py "$TRANSCRIPT" --suggest-topics --n-topics "$N_TOPICS"
+        .venv/bin/python3 segment_select.py "$TRANSCRIPT" --suggest-topics --n-topics "$N_TOPICS" $MODEL_ARG
         ;;
     *)
         # Full pipeline: <video_or_folder> --topic "..." --duration <s> [--timeline-name "..."] [--trim] [--no-cache] [--no-refine]
@@ -90,6 +92,11 @@ case "$1" in
                 --no-refine)   NO_REFINE="--no-refine"; shift ;;
                 --no-cold-open) EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --no-cold-open"; shift ;;
                 --mix)         EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --mix"; shift ;;
+                --model)       EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --model $2"; shift 2 ;;
+                --no-prescore) EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --no-prescore"; shift ;;
+                --prescore-threshold) EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --prescore-threshold $2"; shift 2 ;;
+                --prescore-model) EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --prescore-model $2"; shift 2 ;;
+                --interactive|-i) EXTRA_SELECT_ARGS="$EXTRA_SELECT_ARGS --interactive"; shift ;;
                 *) echo "Unknown argument: $1" >&2; exit 1 ;;
             esac
         done

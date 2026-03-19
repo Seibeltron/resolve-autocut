@@ -6,8 +6,9 @@ Outputs JSON to stdout: {segments, words, total_duration, method, sources}
 Each segment and word is tagged with source_video (absolute path) to support
 multi-clip workflows where segments from different files are merged.
 
-Results are cached in ~/.cache/resolve-autocut/ keyed by file path + mtime.
-Re-running on the same file returns the cached result instantly.
+Transcripts are cached as {video_stem}.autocut-transcript.json alongside the source
+video file, so all users on a shared cloud drive benefit from prior transcriptions.
+Falls back to ~/.cache/resolve-autocut/ if the source directory is not writable.
 
 Usage:
     python transcribe.py /path/to/video.mp4
@@ -52,7 +53,13 @@ def expand_paths(paths: List[str]) -> List[str]:
 # Caching
 # ---------------------------------------------------------------------------
 
-def _cache_key(video_path: str) -> str:
+def _sibling_cache_path(video_path: str) -> Path:
+    """Return {video_dir}/{video_stem}.autocut-transcript.json — stored next to source file."""
+    p = Path(video_path).resolve()
+    return p.parent / f"{p.stem}.autocut-transcript.json"
+
+
+def _local_cache_key(video_path: str) -> str:
     """Return a stable cache key based on absolute path + mtime + size."""
     p = Path(video_path).resolve()
     stat = p.stat()
@@ -60,15 +67,27 @@ def _cache_key(video_path: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _cache_path(video_path: str) -> Path:
+def _local_cache_path(video_path: str) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    key = _cache_key(video_path)
+    key = _local_cache_key(video_path)
     name = Path(video_path).stem[:40]
     return CACHE_DIR / f"{name}_{key}.json"
 
 
 def load_cached(video_path: str) -> Dict | None:
-    cp = _cache_path(video_path)
+    """Check sibling transcript first, then fall back to ~/.cache/."""
+    # 1. Sibling file next to the source video (shared by all users on shared drive)
+    sibling = _sibling_cache_path(video_path)
+    if sibling.exists():
+        try:
+            data = json.loads(sibling.read_text())
+            print(f"Using shared transcript: {sibling}", file=sys.stderr)
+            return data
+        except Exception:
+            sibling.unlink(missing_ok=True)
+
+    # 2. Local per-user cache fallback
+    cp = _local_cache_path(video_path)
     if cp.exists():
         try:
             return json.loads(cp.read_text())
@@ -77,12 +96,24 @@ def load_cached(video_path: str) -> Dict | None:
     return None
 
 
-def save_cache(video_path: str, result: Dict) -> None:
+def save_cache(video_path: str, result: Dict) -> Path:
+    """Try to save alongside source file; fall back to ~/.cache/. Returns the path used."""
+    sibling = _sibling_cache_path(video_path)
     try:
-        cp = _cache_path(video_path)
-        cp.write_text(json.dumps(result))
+        sibling.write_text(json.dumps(result))
+        return sibling
     except Exception:
-        pass  # cache write failure is non-fatal
+        pass
+
+    # Fall back to local cache
+    try:
+        cp = _local_cache_path(video_path)
+        cp.write_text(json.dumps(result))
+        return cp
+    except Exception:
+        pass  # non-fatal
+
+    return sibling  # return intended path even if write failed
 
 
 # ---------------------------------------------------------------------------
@@ -343,44 +374,73 @@ def transcribe(video_path: str) -> Dict:
     }
 
 
-def transcribe_many(video_paths: List[str], no_cache: bool = False) -> Dict:
-    """Transcribe multiple videos and merge into a single combined transcript.
+def _transcribe_one(args) -> tuple:
+    """Worker for parallel transcription. Returns (abs_path, result_dict)."""
+    abs_path, no_cache = args
+    if not no_cache:
+        cached = load_cached(abs_path)
+        if cached:
+            print(f"[cached] {Path(abs_path).name} ({len(cached['segments'])} segments)",
+                  file=sys.stderr, flush=True)
+            for seg in cached.get("segments", []):
+                seg.setdefault("source_video", abs_path)
+            for w in cached.get("words", []):
+                w.setdefault("source_video", abs_path)
+            return abs_path, cached
+
+    print(f"[transcribing] {Path(abs_path).name}", file=sys.stderr, flush=True)
+    result = transcribe(abs_path)
+    if "error" in result:
+        print(f"[error] {Path(abs_path).name}: {result['error']}", file=sys.stderr, flush=True)
+        return abs_path, result
+
+    saved_path = save_cache(abs_path, result)
+    print(f"[saved] {Path(abs_path).name} → {saved_path}", file=sys.stderr, flush=True)
+    return abs_path, result
+
+
+def transcribe_many(video_paths: List[str], no_cache: bool = False,
+                    max_workers: int = 4) -> Dict:
+    """Transcribe multiple videos in parallel and merge into a single combined transcript.
 
     Each segment/word is tagged with source_video so downstream tools can map
     segments back to the correct source file when building a multi-clip timeline.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    abs_paths = [str(Path(p).resolve()) for p in video_paths]
+
+    # Separate cached vs needs-transcription for accurate progress messaging
+    needs_work = []
+    for p in abs_paths:
+        if not no_cache and load_cached(p) is not None:
+            needs_work.append((p, True))   # will hit cache immediately
+        else:
+            needs_work.append((p, no_cache))
+
+    n_total = len(abs_paths)
+    print(f"Processing {n_total} file(s) with up to {max_workers} parallel workers...",
+          file=sys.stderr, flush=True)
+
+    results_by_path: dict = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_transcribe_one, (p, no_cache)): p for p in abs_paths}
+        for fut in as_completed(futures):
+            path, result = fut.result()
+            results_by_path[path] = result
+
+    # Merge in original file order
     all_segments: List[Dict] = []
     all_words: List[Dict] = []
     sources: List[str] = []
 
-    for path in video_paths:
-        abs_path = str(Path(path).resolve())
-        sources.append(abs_path)
-
-        if not no_cache:
-            cached = load_cached(abs_path)
-            if cached:
-                print(f"Using cached transcript for {Path(abs_path).name} "
-                      f"({len(cached['segments'])} segments)", file=sys.stderr)
-                # Back-fill source_video on old caches that predate this field
-                for seg in cached.get("segments", []):
-                    seg.setdefault("source_video", abs_path)
-                for w in cached.get("words", []):
-                    w.setdefault("source_video", abs_path)
-                all_segments.extend(cached["segments"])
-                all_words.extend(cached["words"])
-                continue
-
-        print(f"Transcribing: {Path(abs_path).name}", file=sys.stderr)
-        result = transcribe(abs_path)
+    for abs_path in abs_paths:
+        result = results_by_path.get(abs_path, {})
         if "error" in result:
-            print(f"Error transcribing {Path(abs_path).name}: {result['error']}", file=sys.stderr)
             continue
-
-        save_cache(abs_path, result)
-        print(f"Cached: {_cache_path(abs_path)}", file=sys.stderr)
-        all_segments.extend(result["segments"])
-        all_words.extend(result["words"])
+        sources.append(abs_path)
+        all_segments.extend(result.get("segments", []))
+        all_words.extend(result.get("words", []))
 
     if not all_words:
         return {"error": "No speech detected in any source file"}
@@ -442,8 +502,8 @@ if __name__ == "__main__":
         dur = result["total_duration"]
         print(f"Done: {seg_count} segments, {dur:.1f}s total", file=sys.stderr)
 
-        save_cache(path, result)
-        print(f"Cached to: {_cache_path(path)}", file=sys.stderr)
+        saved_path = save_cache(path, result)
+        print(f"Cached to: {saved_path}", file=sys.stderr)
     else:
         # Multiple files: use transcribe_many()
         result = transcribe_many(video_paths, no_cache=args.no_cache)
