@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils import parse_json_response as _parse_json_response
+
 
 def _words_for_segment(seg: Dict, all_words: List[Dict]) -> List[Dict]:
     """Return words from the transcript that fall within the segment's time range.
@@ -159,8 +161,8 @@ Respond with JSON only, no markdown:
 
     raw = response.choices[0].message.content
     try:
-        gpt_result = json.loads(raw)
-    except json.JSONDecodeError as e:
+        gpt_result = _parse_json_response(raw)
+    except (json.JSONDecodeError, AttributeError) as e:
         return {"error": f"GPT-4o returned invalid JSON: {e}\n{raw[:500]}"}
 
     # Apply trim decisions
@@ -250,7 +252,9 @@ def print_trim_report(original: List[Dict], result: Dict) -> None:
     for i, seg in enumerate(result.get("segments", [])):
         dur = seg["end"] - seg["start"]
         label = " [split]" if "_split_from" in seg else ""
-        print(f"  {i+1:2d}.{label} {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s)",
+        source = seg.get("source_video", "")
+        src_label = f" [{Path(source).name}]" if source else ""
+        print(f"  {i+1:2d}.{label}{src_label} {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s)",
               file=sys.stderr)
         preview = seg.get("text", "")[:70]
         if preview:

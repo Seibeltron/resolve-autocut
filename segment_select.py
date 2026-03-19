@@ -32,21 +32,11 @@ import json
 import os
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
-
-def _parse_json_response(raw: str) -> dict:
-    """Parse a JSON response that may be wrapped in markdown code fences."""
-    clean = raw.strip()
-    if clean.startswith("```"):
-        # Strip opening fence (```json or ```)
-        clean = clean.split("```", 2)[1]
-        if clean.startswith("json"):
-            clean = clean[4:]
-        # Strip closing fence
-        clean = clean.rsplit("```", 1)[0].strip()
-    return json.loads(clean)
+from utils import parse_json_response as _parse_json_response
 
 
 # Words/phrases that make for a poor in-point — GPT is asked to avoid these,
@@ -91,11 +81,19 @@ def suggest_topics(transcript: Dict, n: int = 6, model: str = "anthropic:claude-
     if not api_key:
         return []
 
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
     segments = transcript.get("segments", [])
     total_dur = transcript.get("total_duration", 0)
+
+    # For multi-source transcripts, extract topics per file for better coverage
+    if _is_multi_source(segments):
+        print("Multi-source transcript — using per-file topic extraction...", file=sys.stderr)
+        topics = suggest_topics_per_file(transcript, n=n, model=model)
+        if topics:
+            return topics
+        print("[warn] Per-file extraction failed — falling back to sampled approach", file=sys.stderr)
+
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
     # Sample down to ≤400 segments to stay within token limits for large multi-video transcripts
     MAX_SEGS = 400
@@ -143,16 +141,123 @@ def suggest_topics(transcript: Dict, n: int = 6, model: str = "anthropic:claude-
         return []
 
 
+def suggest_topics_per_file(transcript: Dict, n: int = 6, model: str = "anthropic:claude-sonnet-4-6") -> List[str]:
+    """Extract topics per source file then merge — better coverage for multi-video transcripts.
+
+    For each source file, asks the LLM for up to 4 candidate topics. Then merges all
+    candidates with one final LLM call to pick the best n distinct topics overall.
+    Falls back to empty list on any failure (caller should fall back to sampled approach).
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return []
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    segments = transcript.get("segments", [])
+    by_source: Dict[str, List] = defaultdict(list)
+    for seg in segments:
+        by_source[seg.get("source_video", "")].append(seg)
+
+    print(f"Per-file topics: {len(by_source)} files...", file=sys.stderr)
+
+    n_per_file = min(n, 4)
+    all_candidates: List[str] = []
+
+    for source, segs in by_source.items():
+        if not segs:
+            continue
+        name = Path(source).name if source else "unknown"
+        seg_text = _fmt_seg_list(segs)
+        dur = sum(s["end"] - s["start"] for s in segs)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a video editor analyzing interview/testimonial transcripts. "
+                            "Your job is to identify distinct, meaningful themes suitable for a highlight reel."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Here are {len(segs)} transcript segments from '{name}' ({dur:.0f}s total):\n\n"
+                            f"{seg_text}\n\n"
+                            f"Identify up to {n_per_file} distinct topics or themes that appear in these segments "
+                            "and would make compelling highlight reels. Each topic should be specific enough "
+                            "to guide segment selection, not generic. "
+                            f"Return JSON only: {{\"topics\": [\"topic 1\", ...]}}"
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+            )
+            topics = _parse_json_response(resp.choices[0].message.content).get("topics", [])
+            print(f"  {name}: {len(topics)} topics", file=sys.stderr)
+            all_candidates.extend(topics[:n_per_file])
+        except Exception as e:
+            print(f"  [warn] Per-file topics failed for {name}: {e}", file=sys.stderr)
+            return []
+
+    if not all_candidates:
+        return []
+
+    # Merge and deduplicate: pick the best n from all candidates
+    candidates_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(all_candidates))
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a video editor curating topic candidates for a highlight reel. "
+                        "Merge near-duplicates, remove overlapping topics, and pick the best distinct themes."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Here are topic candidates extracted from {len(by_source)} source videos:\n\n"
+                        f"{candidates_text}\n\n"
+                        f"Merge near-duplicates and select the best {n} distinct topics overall. "
+                        "Each should be specific enough to guide segment selection. "
+                        f"Return JSON only: {{\"topics\": [\"topic 1\", ...]}}"
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        merged = _parse_json_response(resp.choices[0].message.content).get("topics", [])
+        return merged[:n]
+    except Exception as e:
+        print(f"  [warn] Topic merge failed: {e}", file=sys.stderr)
+        return []
+
+
 def prescore_segments(
     transcript: Dict,
     topic: str,
     threshold: float = 4.0,
     model: str = "gpt-4.1-mini",
+    batch_size: int = 150,
 ) -> Dict:
     """Score each segment 1–10 with a cheap model; return transcript filtered to threshold+.
 
     Removes low-scoring segments before the full selection pass, reducing input size
     and steering the expensive model toward higher-quality material.
+    Scores in batches of batch_size to avoid token-limit failures on large transcripts.
     Fails open — if scoring fails for any reason, the original transcript is returned.
     """
     try:
@@ -171,52 +276,70 @@ def prescore_segments(
     if not segments:
         return transcript
 
-    seg_text = _fmt_seg_list(segments)
-    print(f"Pre-scoring {len(segments)} segments with {model}...", file=sys.stderr)
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a video editor scoring transcript segments for editorial value. "
-                    "Score each segment 1–10 based on: relevance to the topic, speech clarity, "
-                    "whether it contains a complete thought, and narrative/emotional value. "
-                    "1–3 = poor (off-topic, pure filler, incomplete sentence). "
-                    "4–6 = usable but not compelling. "
-                    "7–10 = strong editorial material."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Score each segment for a highlight reel focused on: \"{topic}\"\n\n"
-                    f"Segments:\n{seg_text}\n\n"
-                    "Return JSON only: {\"scores\": [score_for_seg_0, score_for_seg_1, ...]}\n"
-                    "One integer score (1–10) per segment, in index order."
-                ),
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
+    n_batches = (len(segments) + batch_size - 1) // batch_size
+    print(
+        f"Pre-scoring {len(segments)} segments with {model}"
+        f"{f' ({n_batches} batches)' if n_batches > 1 else ''}...",
+        file=sys.stderr,
     )
 
-    raw = response.choices[0].message.content
-    try:
-        scores = _parse_json_response(raw).get("scores", [])
-    except (json.JSONDecodeError, AttributeError):
-        print("  [warn] Pre-score JSON parse failed — skipping filter", file=sys.stderr)
-        return transcript
+    system_msg = (
+        "You are a video editor scoring transcript segments for editorial value. "
+        "Score each segment 1–10 based on: relevance to the topic, speech clarity, "
+        "whether it contains a complete thought, and narrative/emotional value. "
+        "1–3 = poor (off-topic, pure filler, incomplete sentence). "
+        "4–6 = usable but not compelling. "
+        "7–10 = strong editorial material."
+    )
 
-    if len(scores) != len(segments):
-        print(
-            f"  [warn] Pre-score returned {len(scores)} scores for {len(segments)} segments "
-            "— skipping filter",
-            file=sys.stderr,
+    all_scores: List = []
+    for batch_idx in range(n_batches):
+        batch = segments[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        if n_batches > 1:
+            print(f"  Batch {batch_idx + 1}/{n_batches} ({len(batch)} segments)...",
+                  file=sys.stderr, flush=True)
+
+        seg_text = _fmt_seg_list(batch)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Score each segment for a highlight reel focused on: \"{topic}\"\n\n"
+                        f"Segments:\n{seg_text}\n\n"
+                        "Return JSON only: {\"scores\": [score_for_seg_0, score_for_seg_1, ...]}\n"
+                        "One integer score (1–10) per segment, in index order."
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
         )
-        return transcript
 
+        raw = response.choices[0].message.content
+        try:
+            scores = _parse_json_response(raw).get("scores", [])
+        except (json.JSONDecodeError, AttributeError):
+            print(
+                f"  [warn] Pre-score batch {batch_idx + 1} JSON parse failed "
+                f"— raw[:200]: {raw[:200]}",
+                file=sys.stderr,
+            )
+            return transcript
+
+        if len(scores) != len(batch):
+            print(
+                f"  [warn] Pre-score batch {batch_idx + 1}: got {len(scores)} scores "
+                f"for {len(batch)} segments — skipping filter",
+                file=sys.stderr,
+            )
+            return transcript
+
+        all_scores.extend(scores)
+
+    scores = all_scores
     kept_pairs = [(seg, scores[i]) for i, seg in enumerate(segments) if float(scores[i]) >= threshold]
     n_dropped = len(segments) - len(kept_pairs)
 
@@ -255,6 +378,15 @@ def _process_gpt_selection(
         i for i in selected_indices_presented
         if isinstance(i, int) and 0 <= i < len(presented_segments)
     ]
+
+    # Deduplicate while preserving order (GPT sometimes returns duplicate indices)
+    seen: set = set()
+    deduped = []
+    for i in selected_indices_presented:
+        if i not in seen:
+            seen.add(i)
+            deduped.append(i)
+    selected_indices_presented = deduped
 
     selected_indices = [shuffle_order[i] for i in selected_indices_presented]
     cold_open_idx = (
@@ -576,10 +708,12 @@ def print_selection_report(result: Dict) -> None:
     print("SELECTION REPORT", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
-    if result.get("summary"):
-        print(f"\nSummary: {result['summary']}", file=sys.stderr)
-    if result.get("flow_note"):
-        print(f"Flow: {result['flow_note']}", file=sys.stderr)
+    summary = result.get("summary", "")
+    if summary and summary.lower() != "placeholder":
+        print(f"\nSummary: {summary}", file=sys.stderr)
+    flow_note = result.get("flow_note", "")
+    if flow_note and flow_note.lower() != "placeholder":
+        print(f"Flow: {flow_note}", file=sys.stderr)
 
     segments = result.get("segments", [])
     total = result.get("total_duration", 0)

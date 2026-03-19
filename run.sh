@@ -114,16 +114,53 @@ case "$1" in
         SEGMENTS="$TMPDIR_WORK/segments.json"
         TRIMMED="$TMPDIR_WORK/trimmed.json"
 
+        # P3.2: Show cache status before potentially long transcription
+        echo "=== Cache status ===" >&2
+        .venv/bin/python3 - "$INPUT" <<'PYEOF' >&2
+import sys
+from pathlib import Path
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v", ".mts", ".avi", ".webm"}
+inp = Path(sys.argv[1])
+files = sorted(f for f in inp.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS) if inp.is_dir() else [inp]
+for f in files:
+    sibling = f.parent / f"{f.stem}.autocut-transcript.json"
+    status = "✓ cached  " if sibling.exists() else "✗ no cache"
+    print(f"  {status}  {f.name}")
+PYEOF
+
         echo "=== Step 1/3: Transcribe ===" >&2
         .venv/bin/python3 transcribe.py $NO_CACHE "$INPUT" > "$TRANSCRIPT"
 
         echo "=== Topics ===" >&2
         .venv/bin/python3 segment_select.py "$TRANSCRIPT" --suggest-topics
 
+        # P3.1: Interactive topic picker when stdin is a terminal
         if [ -z "$TOPIC" ]; then
-            echo "" >&2
-            echo "No --topic provided. Choose a topic above and re-run with --topic \"...\"" >&2
-            exit 0
+            if [ -t 0 ]; then
+                printf "\nEnter topic (copy from above, or press Enter to exit): " >&2
+                read -r TOPIC
+                if [ -z "$TOPIC" ]; then
+                    echo "No topic selected. Exiting." >&2
+                    exit 0
+                fi
+            else
+                echo "" >&2
+                echo "No --topic provided. Choose a topic above and re-run with --topic \"...\"" >&2
+                exit 0
+            fi
+        fi
+
+        # P3.3: Auto-derive timeline name from topic + duration if not specified
+        if [ -z "$TIMELINE_NAME" ] && [ -n "$TOPIC" ]; then
+            DURATION_MIN=$(( (DURATION + 59) / 60 ))
+            TIMELINE_NAME=$(.venv/bin/python3 -c "
+import sys
+topic, mins = sys.argv[1], sys.argv[2]
+words = topic.split()[:5]
+label = ' '.join(words)
+print(f'{label} \u2014 {mins}min')
+" "$TOPIC" "$DURATION_MIN")
+            echo "Timeline name: $TIMELINE_NAME" >&2
         fi
 
         echo "=== Step 2/3: Select segments ===" >&2

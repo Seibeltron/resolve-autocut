@@ -370,15 +370,29 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
             print(f"Deleted existing timeline '{timeline_name}'", file=sys.stderr)
             break
 
-    # Verify project fps matches primary source
+    # Verify project fps matches primary source; auto-set if possible
     project_fps = project.GetSetting("timelineFrameRate")
     if abs(float(project_fps) - float(fps_setting)) > 0.01:
-        print(f"\nERROR: Project fps ({project_fps}) does not match source fps ({fps_setting}).", file=sys.stderr)
-        print(f"Please set the timeline frame rate manually in Resolve:", file=sys.stderr)
-        print(f"  File > Project Settings > Master Settings > Timeline frame rate > {fps_setting}", file=sys.stderr)
-        print(f"Then re-run this script.", file=sys.stderr)
-        return False
-    print(f"Project fps matches source: {fps_setting} ✓", file=sys.stderr)
+        n_timelines = project.GetTimelineCount()
+        auto_set_ok = False
+        if n_timelines == 0:
+            auto_set_ok = bool(project.SetSetting("timelineFrameRate", fps_setting))
+        if auto_set_ok:
+            print(f"Auto-set project fps to {fps_setting} ✓", file=sys.stderr)
+        else:
+            reason = (
+                f"project has {n_timelines} existing timeline(s)"
+                if n_timelines > 0
+                else "SetSetting returned False"
+            )
+            print(f"\nERROR: Project fps ({project_fps}) does not match source fps ({fps_setting}).", file=sys.stderr)
+            print(f"Could not auto-set fps ({reason}).", file=sys.stderr)
+            print(f"Please set the timeline frame rate manually in Resolve:", file=sys.stderr)
+            print(f"  File > Project Settings > Master Settings > Timeline frame rate > {fps_setting}", file=sys.stderr)
+            print(f"Then re-run this script.", file=sys.stderr)
+            return False
+    else:
+        print(f"Project fps matches source: {fps_setting} ✓", file=sys.stderr)
 
     # Create empty timeline
     print(f"Creating empty timeline '{timeline_name}'...", file=sys.stderr)
